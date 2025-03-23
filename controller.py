@@ -6,7 +6,7 @@ import boto3
 import os
 import time
 import threading
-from loguru import logger 
+from loguru import logger
 
 
 # ===
@@ -39,8 +39,10 @@ async def forward_to_pg(reader, writer):
             break
           pg_writer.write(data)
           await pg_writer.drain()
-      except asyncio.CancelledError:
-        raise
+      except (ConnectionResetError, ConnectionError, asyncio.CancelledError) as e:
+        logger.debug(f"Client to PG connection ended: {e}")
+      except Exception as e:
+        logger.exception(f"Unexpected error in client_to_pg: {e}")
 
     async def pg_to_client():
       try:
@@ -49,108 +51,122 @@ async def forward_to_pg(reader, writer):
           if not data: break
           writer.write(data)
           await writer.drain()
-      except asyncio.CancelledError:
-        raise
+      except (ConnectionResetError, ConnectionError, asyncio.CancelledError) as e:
+        logger.debug(f"PG to client connection ended: {e}")
+      except Exception as e:
+        logger.exception(f"Unexpected error in pg_to_client: {e}")
 
-
-    # Store tasks so we can cancel them
     tasks = [
       asyncio.create_task(client_to_pg()),
       asyncio.create_task(pg_to_client())
     ]
-    
-    await asyncio.gather(*tasks)
+
+    # Wait for any task to complete
+    done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+
+    # Cancel any pending tasks
+    for task in pending:
+      task.cancel()
+
   except Exception as e:
-    logger.exception(f'Forwarding error {e}')
+    logger.exception(f'Forwarding setup error: {e}')
   finally:
     # Cancel any pending tasks
     for task in tasks:
-      task.cancel()
+      if not task.done():
+        task.cancel()
 
     if pg_writer is not None:
-      pg_writer.close()
-      await pg_writer.wait_closed()
-    writer.close()
-    await writer.wait_closed()
+      try:
+        pg_writer.close()
+        await pg_writer.wait_closed()
+      except Exception as e:
+        logger.debug(f"Error closing PG connection: {e}")
+
+    try:
+      writer.close()
+      await writer.wait_closed()
+    except Exception as e:
+      logger.debug(f"Error closing client connection: {e}")
 
 
 def is_instance_running():
   ec2_client = session.client('ec2')
-  
+
   # Find the instance by name tag
   response = ec2_client.describe_instances(
     Filters=[
       {'Name': 'tag:Name', 'Values': [INSTANCE_NAME]},
     ]
   )
-  
+
   # Check if any instances are running
   for reservation in response['Reservations']:
     for instance in reservation['Instances']:
       if instance['State']['Name'] == 'running':
         return True
-  
+
   return False
 
 
 async def start_instance():
   ec2 = session.client('ec2')
-  
+
   # Find instance ID by name tag
   response = ec2.describe_instances(
     Filters=[
       {'Name': 'tag:Name', 'Values': [INSTANCE_NAME]},
     ]
   )
-  
+
   if not response['Reservations'] or not response['Reservations'][0]['Instances']:
     raise Exception(f"Instance with name {INSTANCE_NAME} not found")
-    
+
   instance_id = response['Reservations'][0]['Instances'][0]['InstanceId']
-  
+
   # Start the instance
   ec2.start_instances(InstanceIds=[instance_id])
-  
+
   # Wait for the instance to be running
   waiter = ec2.get_waiter('instance_running')
   waiter.wait(InstanceIds=[instance_id])
-  
+
   logger.info(f"Instance {INSTANCE_NAME} ({instance_id}) started successfully")
 
 
 def get_instance_id():
   ec2 = session.client('ec2')
-  
+
   response = ec2.describe_instances(
     Filters=[
       {'Name': 'tag:Name', 'Values': [INSTANCE_NAME]},
     ]
   )
-  
+
   if not response['Reservations'] or not response['Reservations'][0]['Instances']:
     logger.error(f"Instance with name {INSTANCE_NAME} not found")
     return None
-    
+
   return response['Reservations'][0]['Instances'][0]['InstanceId']
 
 def stop_instance():
   time.sleep(BUFFER_TIME_SECS)
   logger.info(f"Stopping instance {INSTANCE_NAME} after {BUFFER_TIME_SECS} seconds of inactivity")
-  
+
   instance_id = get_instance_id()
   if not instance_id:
     return
-  
+
   try:
     ec2 = session.client('ec2')
     ec2.stop_instances(InstanceIds=[instance_id])
-    
+
     logger.info(f"Instance {INSTANCE_NAME} ({instance_id}) stop request initiated")
-    
+
     # Wait for the instance to stop
     waiter = ec2.get_waiter('instance_stopped')
     waiter.wait(InstanceIds=[instance_id])
-    
+
     logger.info(f"Instance {INSTANCE_NAME} ({instance_id}) stopped successfully")
   except Exception as e:
     logger.exception(f"Error stopping instance: {e}")
@@ -160,15 +176,15 @@ stop_thread = None
 
 async def handle_connection(reader, writer):
   global stop_thread
-  
+
   if is_instance_running():
     logger.debug('  instance is running, passing data')
-    
+
     # Cancel existing stop thread if it's running
     if stop_thread and stop_thread.is_alive():
       logger.debug('  cancelling scheduled instance shutdown')
       stop_thread.cancel()
-    
+
     await forward_to_pg(reader, writer)
     logger.debug('  data sent')
 
@@ -180,13 +196,13 @@ async def handle_connection(reader, writer):
     writer.close()
     await writer.wait_closed()
     logger.debug('  message sent to sender')
-  
+
   # Start a new thread to stop the instance after buffer time
   if not stop_thread or not stop_thread.is_alive():
     logger.debug('  scheduling instance shutdown')
     stop_thread = threading.Thread(target=stop_instance, daemon=True)
     stop_thread.start()
-  
+
 
 async def main():
   server = await asyncio.start_server(handle_connection, HOST, PORT)
