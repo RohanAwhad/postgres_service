@@ -75,20 +75,23 @@ async def forward_to_pg(reader, writer):
 
 
 def is_instance_running():
-  ec2 = session.client('ec2')
+  ec2_client = session.client('ec2')
   
   # Find the instance by name tag
-  instances = list(ec2.instances.filter(
+  response = ec2_client.describe_instances(
     Filters=[
       {'Name': 'tag:Name', 'Values': [INSTANCE_NAME]},
     ]
-  ))
+  )
   
-  if not instances:
-    return False
-    
-  instance = instances[0]
-  return instance.state['Name'] == 'running'
+  # Check if any instances are running
+  for reservation in response['Reservations']:
+    for instance in reservation['Instances']:
+      if instance['State']['Name'] == 'running':
+        return True
+  
+  return False
+
 
 async def start_instance():
   ec2 = session.client('ec2')
