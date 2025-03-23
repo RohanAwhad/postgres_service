@@ -22,6 +22,10 @@ PORT = os.environ.get('CONTROLLER_PORT', '5432')
 BUFFER_TIME_SECS = int(os.environ.get('TIMEOUT_SECS', 30 * 60))
 
 session = boto3.Session(aws_access_key_id=AWS_ACCESS_KEY_ID, aws_secret_access_key=AWS_SECRET_KEY, region_name='us-east-1')
+
+# Track the stop instance thread
+stop_thread = None
+shutdown_event = threading.Event()
 # ===
 # Monitoring
 # ===
@@ -150,9 +154,13 @@ def get_instance_id():
   return response['Reservations'][0]['Instances'][0]['InstanceId']
 
 def stop_instance():
-  time.sleep(BUFFER_TIME_SECS)
-  logger.info(f"Stopping instance {INSTANCE_NAME} after {BUFFER_TIME_SECS} seconds of inactivity")
+  # Wait for the timeout or until the event is set
+  if shutdown_event.wait(timeout=BUFFER_TIME_SECS):
+    # Event was set, cancel the shutdown
+    logger.info("Scheduled shutdown cancelled")
+    return
 
+  logger.info(f"Stopping instance {INSTANCE_NAME} after {BUFFER_TIME_SECS} seconds of inactivity")
   instance_id = get_instance_id()
   if not instance_id:
     return
@@ -171,11 +179,9 @@ def stop_instance():
   except Exception as e:
     logger.exception(f"Error stopping instance: {e}")
 
-# Track the stop instance thread
-stop_thread = None
 
 async def handle_connection(reader, writer):
-  global stop_thread
+  global stop_thread, shutdown_event
 
   if is_instance_running():
     logger.debug('  instance is running, passing data')
@@ -183,7 +189,7 @@ async def handle_connection(reader, writer):
     # Cancel existing stop thread if it's running
     if stop_thread and stop_thread.is_alive():
       logger.debug('  cancelling scheduled instance shutdown')
-      stop_thread.cancel()
+      shutdown_event.set()
 
     await forward_to_pg(reader, writer)
     logger.debug('  data sent')
@@ -200,6 +206,7 @@ async def handle_connection(reader, writer):
   # Start a new thread to stop the instance after buffer time
   if not stop_thread or not stop_thread.is_alive():
     logger.debug('  scheduling instance shutdown')
+    shutdown_event = threading.Event()
     stop_thread = threading.Thread(target=stop_instance, daemon=True)
     stop_thread.start()
 
